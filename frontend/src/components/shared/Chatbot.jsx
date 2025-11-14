@@ -22,7 +22,7 @@ const Chatbot = () => {
     setLoading(true)
     try{
   // Use relative API path so Vite dev server can proxy /api to the backend (configured in vite.config.js)
-  const res = await axios.post('/api/v1/chat', {message: text})
+  const res = await axios.post('/api/v1/chat', {message: text}) 
       if(res?.data?.success){
         setMessages(m => [...m, {from:'bot', text: res.data.reply}])
       } else {

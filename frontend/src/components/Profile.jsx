@@ -17,10 +17,89 @@ function Profile() {
         useGetAppliedJobs();
         const [open, setOpen]= useState(false);
         const [atsLoading, setAtsLoading] = useState(false);
+        const [atsResult, setAtsResult] = useState(null);
         const {user} = useSelector(store => store.auth);
 
         const resumeUrl = user?.profile?.resume;
         const resumeDisplayName = user?.profile?.resumeOriginalName || "View Resume PDF";
+
+        // helper: try to extract reply string and parsed object from many possible shapes
+        const extractReplyAndParsed = (resData) => {
+            if (!resData) return { reply: '', parsed: null, raw: resData };
+            // prefer explicit parsed field
+            if (resData.parsed) return { reply: resData.reply ?? '', parsed: resData.parsed, raw: resData.raw ?? resData };
+            // if reply present and looks like JSON, parse it
+            const replyCandidate = (typeof resData === 'string') ? resData : (resData.reply ?? resData.outputText ?? resData.text ?? '');
+            let parsed = null;
+            if (replyCandidate && typeof replyCandidate === 'string') {
+                try { parsed = JSON.parse(replyCandidate); } catch(e){
+                    const m = replyCandidate.match(/\{[\s\S]*\}/);
+                    if (m) {
+                        try { parsed = JSON.parse(m[0]); } catch{}
+                    }
+                }
+            }
+            // try to locate JSON inside nested raw payload shapes
+            const raw = resData.raw ?? resData;
+            // common Gemini shape: candidates -> content -> parts -> text
+            const tryExtractTextFromRaw = (d) => {
+                try {
+                    if (!d) return '';
+                    if (d?.candidates?.[0]?.content?.[0]?.parts?.[0]?.text) return d.candidates[0].content[0].parts[0].text;
+                    if (d?.candidates?.[0]?.content?.parts) {
+                        // avoid flatMap on non-array shapes
+                        const contentArr = Array.isArray(d.candidates[0].content) ? d.candidates[0].content : [d.candidates[0].content];
+                        for (const c of contentArr) {
+                            if (!c) continue;
+                            const parts = Array.isArray(c.parts) ? c.parts : [];
+                            for (const p of parts) if (p?.text) return p.text;
+                        }
+                    }
+                    if (d?.outputs?.[0]?.content?.[0]?.text) return d.outputs[0].content[0].text;
+                    if (d?.choices?.[0]?.message?.content) return d.choices[0].message.content;
+                    if (d?.choices?.[0]?.text) return d.choices[0].text;
+                    if (d?.reply) return d.reply;
+                    if (d?.outputText) return d.outputText;
+                    if (typeof d === 'string') return d;
+                    return '';
+                } catch { return ''; }
+            };
+            const textFromRaw = parsed ? '' : tryExtractTextFromRaw(raw);
+            if (!parsed && textFromRaw) {
+                try { parsed = JSON.parse(textFromRaw); } catch(e){
+                    const m = textFromRaw.match(/\{[\s\S]*\}/);
+                    if (m) {
+                        try { parsed = JSON.parse(m[0]); } catch{}
+                    }
+                }
+            }
+            const reply = replyCandidate || textFromRaw || '';
+            return { reply, parsed, raw };
+        };
+
+        // helper: extract score integer from parsed object or free text
+        const extractScoreValue = ({ parsed, reply, raw }) => {
+            // priority: parsed.score
+            if (parsed && (parsed.score !== undefined && parsed.score !== null)) {
+                const s = Number(parsed.score);
+                if (!Number.isNaN(s)) return s;
+            }
+            // try to find "score": number in reply or raw.stringify
+            const searchSpaces = (str) => {
+                if (!str) return null;
+                const m1 = str.match(/"score"\s*[:]\s*(\d{1,3})/i) || str.match(/score\s*[:=]\s*(\d{1,3})/i) || str.match(/\bscore\s+is\s+(\d{1,3})\b/i);
+                if (m1) return Number(m1[1]);
+                return null;
+            }
+            const v1 = searchSpaces(reply);
+            if (v1 !== null) return v1;
+            const rawText = (() => {
+                try { return JSON.stringify(raw); } catch { return String(raw || '') }
+            })();
+            const v2 = searchSpaces(rawText);
+            if (v2 !== null) return v2;
+            return null;
+        };
 
     return (
         <div>
@@ -108,20 +187,44 @@ function Profile() {
                                             try{
                                                 toast('Computing ATS score...')
                                                 const res = await axios.get('/api/v1/user/ats-score-ai', { withCredentials: true })
-                                                if(res?.data?.success){
-                                                    const parsed = res.data.parsed;
-                                                    if(parsed && parsed.score !== undefined){
-                                                        toast.success(`ATS Score: ${parsed.score}`)
-                                                    } else {
-                                                        toast.success('ATS computed — check console for details')
-                                                        console.log('ATS raw reply:', res.data.reply);
-                                                    }
+                                                console.log('ATS API response:', { status: res.status, data: res.data, headers: res.headers })
+
+                                                // normalize response
+                                                const normalized = extractReplyAndParsed(res.data);
+                                                const score = extractScoreValue(normalized);
+
+                                                // prefer API explicit score / recommendations, fallback to extracted values
+                                                const apiScore = (res?.data?.score ?? null);
+                                                const apiRecs = (res?.data?.recommendations ?? null);
+                                                const finalScore = apiScore !== null ? apiScore : score;
+                                                const recsCandidate =
+                                                    apiRecs ??
+                                                    normalized.parsed?.recommendations ??
+                                                    (Array.isArray(normalized.raw?.recommendations) ? normalized.raw.recommendations : null);
+
+                                                const recommendations = Array.isArray(recsCandidate)
+                                                    ? recsCandidate
+                                                    : (recsCandidate ? [String(recsCandidate)] : []);
+
+                                                setAtsResult({
+                                                    parsed: normalized.parsed,
+                                                    raw: normalized.raw,
+                                                    reply: normalized.reply,
+                                                    score: finalScore,
+                                                    recommendations
+                                                });
+
+                                                if (finalScore !== null && finalScore !== undefined) {
+                                                  toast.success(`ATS Score: ${finalScore}`);
+                                                } else if (res?.data?.success) {
+                                                  toast.success('ATS computed — see result below');
                                                 } else {
-                                                    const msg = res?.data?.message || 'Failed to compute ATS';
-                                                    toast.error(msg)
+                                                  const msg = res?.data?.message || 'Failed to compute ATS';
+                                                  toast.error(msg);
                                                 }
                                             }catch(err){
                                                 console.error('ATS AI error', err);
+                                                setAtsResult({ error: err?.response?.data?.message || err?.message || 'Error', raw: err?.response?.data || err });
                                                 const msg = err?.response?.data?.message || err?.message || 'Network or server error while computing ATS';
                                                 toast.error(msg)
                                             } finally{
@@ -129,6 +232,38 @@ function Profile() {
                                             }
                                         }} disabled={atsLoading}>{atsLoading ? 'Computing...' : 'Get ATS (AI)'}</Button>
                                 </div>
+
+                                {/* show recommendations (if any) */}
+                                {atsResult?.recommendations && atsResult.recommendations.length > 0 && (
+                                    <div className="mt-3 p-3 bg-white border rounded">
+                                        <div className="text-sm font-semibold mb-2">Resume improvement suggestions</div>
+                                        <ul className="list-disc list-inside space-y-1">
+                                            {atsResult.recommendations.map((rec, idx) => (
+                                                <li key={idx} className="text-sm text-gray-700">{rec}</li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                )}
+
+                                {/* show score */}
+                                {atsResult?.score !== null && atsResult?.score !== undefined && (
+                                    <div className="mt-3 p-3 bg-green-50 border rounded">
+                                        <div className="text-lg font-semibold">ATS Score: {atsResult.score}</div>
+                                        {atsResult.parsed?.summary && <div className="mt-2">{atsResult.parsed.summary}</div>}
+                                    </div>
+                                )}
+
+                                {/* show errors or notices only (no raw AI payload) */}
+                                {atsResult?.error && (
+                                    <div className="mt-3 p-3 bg-red-50 border rounded">
+                                        <div className="text-red-600"><strong>Error:</strong> {atsResult.error}</div>
+                                    </div>
+                                )}
+                                {atsResult?.notice && (
+                                    <div className="mt-3 p-3 bg-yellow-50 border rounded">
+                                        <div className="text-yellow-800">{atsResult.notice}</div>
+                                    </div>
+                                )}
                             </div>
                         ) : (
                             <span className="text-gray-500">Resume not uploaded</span>

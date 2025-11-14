@@ -43,7 +43,7 @@ export const chatHandler = async (req, res) => {
             generationConfig: {
                 temperature: 0.2,
                 maxOutputTokens: 500
-            }
+            } 
         };
 
         // 6. Call Gemini API via fetch
